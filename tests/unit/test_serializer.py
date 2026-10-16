@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -489,3 +490,46 @@ def test_dict_with_non_string_keys_is_serialized(input_obj, expected):
     result = json.loads(EventSerializer().encode(input_obj))
 
     assert result == expected
+
+
+class _HashableKey:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __hash__(self):
+        return hash(self.tag)
+
+    def __eq__(self, other):
+        return isinstance(other, _HashableKey) and self.tag == other.tag
+
+
+@pytest.mark.parametrize(
+    "bad_key, expected_key",
+    [
+        (("model", "version"), "['model', 'version']"),
+        (frozenset({1, 2}), "[1, 2]"),
+        (_HashableKey("k"), "{'tag': 'k'}"),
+    ],
+    ids=["tuple_key", "frozenset_key", "opaque_object_key"],
+)
+def test_dict_with_non_primitive_key_does_not_discard_other_entries(
+    bad_key, expected_key
+):
+    result = json.loads(
+        EventSerializer().encode({"keep": 1, bad_key: 2, "also_kept": 3})
+    )
+
+    assert result == {"keep": 1, expected_key: 2, "also_kept": 3}
+
+
+def test_degraded_key_colliding_with_a_real_key_is_logged(caplog):
+    caplog.set_level(logging.DEBUG, logger="langfuse._utils.serializer")
+
+    result = json.loads(
+        EventSerializer().encode(
+            {("model", "version"): "from_tuple", "['model', 'version']": "literal"}
+        )
+    )
+
+    assert result == {"['model', 'version']": "literal"}
+    assert "duplicate dict key" in caplog.text

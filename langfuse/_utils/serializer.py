@@ -153,7 +153,27 @@ class EventSerializer(JSONEncoder):
                 return [self.default(item) for item in obj]
 
             if isinstance(obj, dict):
-                return {self.default(k): self.default(v) for k, v in obj.items()}
+                # A key that serializes to an unhashable value (a tuple or set
+                # becomes a list) or to something JSON cannot use as an object
+                # key would otherwise raise out of the comprehension and cost
+                # the entire mapping, including its well-behaved siblings.
+                encoded: dict[Any, Any] = {}
+                for key, value in obj.items():
+                    encoded_key = self._encode_dict_key(key)
+
+                    if encoded_key in encoded:
+                        # A degraded key can collide with a genuine one (or
+                        # with an earlier degradation). Last write wins, as it
+                        # would have for a real duplicate key, but the user
+                        # cannot see that an entry went missing.
+                        logger.debug(
+                            "Serialization dropped a duplicate dict key %r",
+                            key,
+                        )
+
+                    encoded[encoded_key] = self.default(value)
+
+                return encoded
 
             if isinstance(obj, list):
                 return [self.default(item) for item in obj]
@@ -192,6 +212,29 @@ class EventSerializer(JSONEncoder):
                 exc_info=e,
             )
             return f'"<not serializable object of type: {type(obj).__name__}>"'
+
+    def _encode_dict_key(self, key: Any) -> Any:
+        """Serialize a dict key, degrading to a readable stand-in if it cannot be one.
+
+        JSON object keys are strings, and the encoder renders the str, int,
+        float and None we hand back on its own -- matching what the sibling
+        test_dict_with_non_string_keys_is_serialized already expects. Anything
+        else, notably a tuple or set key which serializes to a list, becomes
+        its string form, so one unusable key costs only itself rather than the
+        whole mapping.
+
+        The stand-in inherits whatever the serializer produced, so a key whose
+        serialized form embeds an object repr (<Thing object at 0x...>) is
+        not stable across processes. That is pre-existing -- the same repr
+        already reaches the output in value position -- and is the price of
+        keeping the entry at all.
+        """
+        encoded = self.default(key)
+
+        if encoded is None or isinstance(encoded, (str, bool, int, float)):
+            return encoded
+
+        return str(encoded)
 
     def encode(self, obj: Any) -> str:
         self.seen.clear()  # Clear seen objects before each encode call
